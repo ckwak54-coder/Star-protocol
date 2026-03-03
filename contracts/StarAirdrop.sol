@@ -49,3 +49,4 @@ contract StarAirdrop {
         IERC20(tokenAddress).transfer(owner, amount);
     }
 }
+
