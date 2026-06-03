@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 interface IStarStaking {
     function stakes(address user) external view returns (uint256 amount, uint256 timestamp, bool active);
     function totalStaked() external view returns (uint256);
@@ -10,11 +13,13 @@ interface IStarStaking {
 /**
  * @title StarGovernance
  * @dev Governance contract for voting on protocol parameters
+ * - Time-locked proposals
+ * - Vote tracking with reset capability
+ * - Safe execution with reentrancy guard
  */
-contract StarGovernance {
+contract StarGovernance is Ownable, ReentrancyGuard {
 
-    IStarStaking public stakingContract;
-    address public owner;
+    IStarStaking public immutable stakingContract;
 
     struct Proposal {
         uint256 newRewardRate;
@@ -26,25 +31,22 @@ contract StarGovernance {
     }
 
     uint256 public proposalCount = 0;
+    uint256 public votingDuration = 3 days;
+
     Proposal public currentProposal;
 
     mapping(address => bool) public hasVoted;
     mapping(uint256 => Proposal) public proposals;
+    mapping(uint256 => mapping(address => bool)) public proposalVotes;
 
     event ProposalCreated(uint256 indexed proposalId, uint256 newRate, uint256 endTime);
-    event Voted(address indexed voter, bool support, uint256 weight);
+    event Voted(address indexed voter, uint256 indexed proposalId, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed proposalId, uint256 newRate, bool passed);
-    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event VotingDurationUpdated(uint256 oldDuration, uint256 newDuration);
 
-    constructor(address _stakingAddress) {
+    constructor(address _stakingAddress) Ownable(msg.sender) {
         require(_stakingAddress != address(0), "StarGovernance: Invalid staking address");
         stakingContract = IStarStaking(_stakingAddress);
-        owner = msg.sender;
-    }
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "StarGovernance: Caller is not the owner");
-        _;
     }
 
     /**
@@ -53,17 +55,17 @@ contract StarGovernance {
      */
     function createProposal(uint256 _newRewardRate) external onlyOwner {
         require(_newRewardRate <= 100, "StarGovernance: Reward rate cannot exceed 100%");
-        require(currentProposal.endTime < block.timestamp || currentProposal.executed, "StarGovernance: Active proposal exists");
+        require(
+            currentProposal.endTime < block.timestamp || currentProposal.executed,
+            "StarGovernance: Active proposal exists"
+        );
 
-        // Reset voting mapping for all previous voters
-        // Note: In production, consider using a more gas-efficient approach
-        
         uint256 proposalId = proposalCount;
         proposalCount++;
 
         currentProposal = Proposal({
             newRewardRate: _newRewardRate,
-            endTime: block.timestamp + 3 days,
+            endTime: block.timestamp + votingDuration,
             votesFor: 0,
             votesAgainst: 0,
             executed: false,
@@ -72,9 +74,6 @@ contract StarGovernance {
 
         proposals[proposalId] = currentProposal;
 
-        // Clear previous votes
-        hasVoted[msg.sender] = false; // Reset for next proposal
-
         emit ProposalCreated(proposalId, _newRewardRate, currentProposal.endTime);
     }
 
@@ -82,7 +81,7 @@ contract StarGovernance {
      * @dev Vote on current proposal
      * @param support True to vote for, false to vote against
      */
-    function vote(bool support) external {
+    function vote(bool support) external nonReentrant {
         require(block.timestamp < currentProposal.endTime, "StarGovernance: Voting period has ended");
         require(!hasVoted[msg.sender], "StarGovernance: Voter has already voted");
 
@@ -90,6 +89,7 @@ contract StarGovernance {
         require(active && amount > 0, "StarGovernance: Voter must have active stake");
 
         hasVoted[msg.sender] = true;
+        proposalVotes[proposalCount - 1][msg.sender] = true;
 
         if (support) {
             currentProposal.votesFor += amount;
@@ -97,13 +97,13 @@ contract StarGovernance {
             currentProposal.votesAgainst += amount;
         }
 
-        emit Voted(msg.sender, support, amount);
+        emit Voted(msg.sender, proposalCount - 1, support, amount);
     }
 
     /**
      * @dev Execute proposal after voting period ends
      */
-    function executeProposal() external {
+    function executeProposal() external nonReentrant {
         require(block.timestamp >= currentProposal.endTime, "StarGovernance: Voting still active");
         require(!currentProposal.executed, "StarGovernance: Proposal already executed");
 
@@ -121,22 +121,33 @@ contract StarGovernance {
     }
 
     /**
-     * @dev Reset votes for next proposal (called by createProposal)
+     * @dev Reset votes for specific users (for next proposal)
+     * @param voters Array of voter addresses to reset
      */
     function resetVotes(address[] calldata voters) external onlyOwner {
         for (uint256 i = 0; i < voters.length; i++) {
+            require(voters[i] != address(0), "StarGovernance: Invalid voter address");
             hasVoted[voters[i]] = false;
         }
     }
 
     /**
-     * @dev Transfer ownership
-     * @param newOwner Address of new owner
+     * @dev Update voting duration
+     * @param newDuration New voting duration in seconds
      */
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "StarGovernance: Invalid new owner address");
-        address oldOwner = owner;
-        owner = newOwner;
-        emit OwnershipTransferred(oldOwner, newOwner);
+    function updateVotingDuration(uint256 newDuration) external onlyOwner {
+        require(newDuration > 0, "StarGovernance: Duration must be greater than 0");
+        uint256 oldDuration = votingDuration;
+        votingDuration = newDuration;
+        emit VotingDurationUpdated(oldDuration, newDuration);
+    }
+
+    /**
+     * @dev Check if user has voted on proposal
+     * @param proposalId Proposal ID
+     * @param voter Voter address
+     */
+    function hasVotedOnProposal(uint256 proposalId, address voter) external view returns (bool) {
+        return proposalVotes[proposalId][voter];
     }
 }
